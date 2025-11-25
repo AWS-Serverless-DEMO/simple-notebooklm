@@ -30,6 +30,10 @@ def initialize_session_state():
         st.session_state.document_name = None
     if 'chat_history' not in st.session_state:
         st.session_state.chat_history = []
+    if 'stored_documents' not in st.session_state:
+        st.session_state.stored_documents = []
+    if 'refresh_documents' not in st.session_state:
+        st.session_state.refresh_documents = True
 
 
 def validate_config():
@@ -89,6 +93,62 @@ def process_document(uploaded_file):
         return False
 
 
+def load_stored_documents(vector_store: S3VectorStore) -> None:
+    """Load list of stored documents from S3 Vectors"""
+    try:
+        st.session_state.stored_documents = vector_store.list_documents()
+        st.session_state.refresh_documents = False
+    except Exception as e:
+        st.error(f"문서 목록 로딩 실패: {str(e)}")
+        st.session_state.stored_documents = []
+
+
+def delete_document(vector_store: S3VectorStore, document_name: str) -> bool:
+    """Delete a specific document from vector store"""
+    try:
+        result = vector_store.delete_vectors_by_document(document_name)
+
+        if result['deleted_count'] > 0:
+            st.success(f"✅ {result['message']}")
+            st.session_state.refresh_documents = True
+
+            # Reset current document if it was deleted
+            if st.session_state.document_name == document_name:
+                st.session_state.document_processed = False
+                st.session_state.document_name = None
+                st.session_state.chat_history = []
+
+            return True
+        else:
+            st.warning(f"⚠️ {result['message']}")
+            return False
+
+    except Exception as e:
+        st.error(f"❌ 삭제 중 오류 발생: {str(e)}")
+        return False
+
+
+def delete_all_documents(vector_store: S3VectorStore) -> bool:
+    """Delete all documents from vector store"""
+    try:
+        result = vector_store.delete_all_vectors()
+
+        if result['deleted_count'] > 0:
+            st.success(f"✅ {result['message']}")
+            st.session_state.refresh_documents = True
+            st.session_state.document_processed = False
+            st.session_state.document_name = None
+            st.session_state.chat_history = []
+            return True
+        else:
+            st.info(f"ℹ️ {result['message']}")
+            return False
+
+    except Exception as e:
+        st.error(f"❌ 삭제 중 오류 발생: {str(e)}")
+        return False
+
+
 def display_answer(result):
     """Display answer with sources in a formatted way"""
     # Display answer
@@ -125,6 +185,9 @@ def main():
     if not validate_config():
         st.stop()
 
+    # Initialize vector store once
+    vector_store = S3VectorStore()
+
     # Sidebar - Document Upload
     with st.sidebar:
         st.header("📤 문서 업로드")
@@ -137,13 +200,66 @@ def main():
 
         if uploaded_file:
             if st.button("📄 문서 처리 시작", type="primary", use_container_width=True):
-                process_document(uploaded_file)
+                if process_document(uploaded_file):
+                    st.session_state.refresh_documents = True
 
         # Show current document status
         if st.session_state.document_processed:
             st.success(f"✅ 현재 문서: {st.session_state.document_name}")
         else:
             st.info("⏳ 문서를 업로드하고 처리해주세요")
+
+        # Document Management Section
+        st.markdown("---")
+        st.header("🗂️ 문서 관리")
+
+        # Load stored documents
+        if st.session_state.refresh_documents:
+            with st.spinner("문서 목록 로딩 중..."):
+                load_stored_documents(vector_store)
+
+        # Display stored documents
+        if st.session_state.stored_documents:
+            st.markdown(f"**저장된 문서: {len(st.session_state.stored_documents)}개**")
+
+            for doc in st.session_state.stored_documents:
+                with st.expander(f"📄 {doc['document']}", expanded=False):
+                    st.caption(f"타입: {doc['source_type']}")
+                    st.caption(f"청크: {doc['chunk_count']}개")
+                    st.caption(f"페이지: {doc['page_count']}개")
+
+                    if st.button(
+                        "🗑️ 삭제",
+                        key=f"delete_{doc['document']}",
+                        use_container_width=True,
+                        type="secondary"
+                    ):
+                        if delete_document(vector_store, doc['document']):
+                            st.rerun()
+
+            # Delete all button
+            st.markdown("---")
+            if st.button(
+                "🗑️ 모든 문서 삭제",
+                use_container_width=True,
+                type="secondary",
+                help="저장된 모든 문서를 삭제합니다"
+            ):
+                if st.session_state.get('confirm_delete_all'):
+                    if delete_all_documents(vector_store):
+                        st.session_state.confirm_delete_all = False
+                        st.rerun()
+                else:
+                    st.session_state.confirm_delete_all = True
+                    st.warning("⚠️ 한 번 더 클릭하면 모든 문서가 삭제됩니다!")
+                    st.rerun()
+
+            if st.button("🔄 목록 새로고침", use_container_width=True):
+                st.session_state.refresh_documents = True
+                st.rerun()
+
+        else:
+            st.info("저장된 문서가 없습니다")
 
         # Configuration display
         st.markdown("---")

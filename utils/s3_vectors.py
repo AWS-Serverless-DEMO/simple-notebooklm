@@ -142,6 +142,75 @@ class S3VectorStore:
         except Exception as e:
             raise RuntimeError(f"Failed to query vectors: {str(e)}")
 
+    def list_all_vectors(self) -> List[Dict]:
+        """
+        List all vectors in the index with their metadata
+
+        Returns:
+            List of all vectors with keys and metadata
+        """
+        try:
+            # Query with a very large top_k to get all vectors
+            # Note: This is a workaround since S3 Vectors doesn't have a direct list API
+            response = self.s3vectors.query_vectors(
+                vectorBucketName=self.bucket_name,
+                indexName=self.index_name,
+                queryVector={'float32': [0.0] * 1024},  # Dummy vector
+                topK=10000,  # Maximum allowed
+                includeMetadata=True,
+                includeVectorData=False
+            )
+
+            vectors = []
+            for vector_result in response.get('vectors', []):
+                vectors.append({
+                    'key': vector_result['key'],
+                    'metadata': vector_result.get('metadata', {}),
+                    'distance': vector_result.get('distance', 0)
+                })
+
+            return vectors
+
+        except Exception as e:
+            raise RuntimeError(f"Failed to list vectors: {str(e)}")
+
+    def delete_vectors_by_keys(self, keys: List[str]) -> Dict:
+        """
+        Delete vectors by their keys (batch deletion)
+
+        Args:
+            keys: List of vector keys to delete
+
+        Returns:
+            Deletion result with count
+        """
+        if not keys:
+            return {'deleted_count': 0, 'message': 'No keys provided'}
+
+        try:
+            # Delete in batches (max 1000 per request as per AWS limits)
+            batch_size = 1000
+            total_deleted = 0
+
+            for i in range(0, len(keys), batch_size):
+                batch_keys = keys[i:i + batch_size]
+
+                self.s3vectors.delete_vectors(
+                    vectorBucketName=self.bucket_name,
+                    indexName=self.index_name,
+                    keys=batch_keys
+                )
+
+                total_deleted += len(batch_keys)
+
+            return {
+                'deleted_count': total_deleted,
+                'message': f'Successfully deleted {total_deleted} vectors'
+            }
+
+        except Exception as e:
+            raise RuntimeError(f"Failed to delete vectors: {str(e)}")
+
     def delete_vectors_by_document(self, document_name: str) -> Dict:
         """
         Delete all vectors for a specific document
@@ -150,8 +219,104 @@ class S3VectorStore:
             document_name: Name of the document
 
         Returns:
-            Deletion result
+            Deletion result with count
         """
-        # Note: S3 Vectors doesn't have a direct delete by metadata filter
-        # This is a placeholder for future implementation
-        raise NotImplementedError("Delete by document not yet implemented in S3 Vectors API")
+        try:
+            # First, find all vectors for this document
+            all_vectors = self.list_all_vectors()
+
+            # Filter by document name
+            keys_to_delete = [
+                vec['key']
+                for vec in all_vectors
+                if vec['metadata'].get('document') == document_name
+            ]
+
+            if not keys_to_delete:
+                return {
+                    'deleted_count': 0,
+                    'message': f'No vectors found for document: {document_name}'
+                }
+
+            # Delete the filtered vectors
+            result = self.delete_vectors_by_keys(keys_to_delete)
+            result['document'] = document_name
+
+            return result
+
+        except Exception as e:
+            raise RuntimeError(f"Failed to delete vectors for document '{document_name}': {str(e)}")
+
+    def delete_all_vectors(self) -> Dict:
+        """
+        Delete all vectors in the index
+
+        Returns:
+            Deletion result with count
+        """
+        try:
+            # Get all vectors
+            all_vectors = self.list_all_vectors()
+
+            if not all_vectors:
+                return {
+                    'deleted_count': 0,
+                    'message': 'No vectors found in index'
+                }
+
+            # Extract all keys
+            all_keys = [vec['key'] for vec in all_vectors]
+
+            # Delete all vectors
+            result = self.delete_vectors_by_keys(all_keys)
+
+            return result
+
+        except Exception as e:
+            raise RuntimeError(f"Failed to delete all vectors: {str(e)}")
+
+    def list_documents(self) -> List[Dict]:
+        """
+        List all unique documents in the vector store
+
+        Returns:
+            List of documents with metadata (name, total chunks, source type)
+        """
+        try:
+            all_vectors = self.list_all_vectors()
+
+            # Group by document name
+            documents_map = {}
+
+            for vec in all_vectors:
+                doc_name = vec['metadata'].get('document', 'unknown')
+
+                if doc_name not in documents_map:
+                    documents_map[doc_name] = {
+                        'document': doc_name,
+                        'source_type': vec['metadata'].get('source_type', 'unknown'),
+                        'chunk_count': 0,
+                        'pages': set()
+                    }
+
+                documents_map[doc_name]['chunk_count'] += 1
+
+                # Collect unique pages
+                page = vec['metadata'].get('page')
+                if page:
+                    documents_map[doc_name]['pages'].add(int(page))
+
+            # Convert to list and format
+            documents = []
+            for doc_info in documents_map.values():
+                doc_info['page_count'] = len(doc_info['pages']) if doc_info['pages'] else 0
+                doc_info['pages'] = sorted(list(doc_info['pages'])) if doc_info['pages'] else []
+                documents.append(doc_info)
+
+            # Sort by document name
+            documents.sort(key=lambda x: x['document'])
+
+            return documents
+
+        except Exception as e:
+            raise RuntimeError(f"Failed to list documents: {str(e)}")

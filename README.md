@@ -44,6 +44,7 @@ Simple NotebookLM은 PDF, DOCX, TXT 문서를 업로드하고 AI에게 문서 �
 ```
 simple-notebooklm/
 ├── app.py                      # Streamlit 메인 애플리케이션
+├── cleanup.py                  # 리소스 정리 스크립트 (NEW!)
 ├── config.py                   # 설정 관리
 ├── requirements.txt            # Python 패키지 의존성
 ├── .env.example               # 환경변수 템플릿
@@ -53,7 +54,7 @@ simple-notebooklm/
     ├── document_processor.py  # PDF/DOCX/TXT 텍스트 추출
     ├── text_splitter.py       # LangChain 청크 분할
     ├── embeddings.py          # Bedrock Titan Embeddings
-    ├── s3_vectors.py          # S3 Vectors 관리 (PutVectors/QueryVectors)
+    ├── s3_vectors.py          # S3 Vectors 관리 (PutVectors/QueryVectors/DeleteVectors)
     └── rag_engine.py          # Claude RAG 엔진
 ```
 
@@ -105,7 +106,8 @@ IAM 사용자/역할에 다음 권한 추가:
       "Action": [
         "s3vectors:PutVectors",
         "s3vectors:QueryVectors",
-        "s3vectors:GetVectors"
+        "s3vectors:GetVectors",
+        "s3vectors:DeleteVectors"
       ],
       "Resource": "arn:aws:s3vectors:*:*:vectorbucket/*"
     }
@@ -190,6 +192,92 @@ streamlit run app.py
    - 답변 내용 표시
    - 출처 정보 (문서명, 페이지, 유사도) 제공
    - 관련 청크 미리보기 제공
+
+5. **문서 관리**
+   - 사이드바 "🗂️ 문서 관리" 섹션에서 저장된 문서 확인
+   - 개별 문서 삭제 또는 전체 삭제 가능
+   - 목록 새로고침으로 최신 상태 유지
+
+## 🧹 리소스 정리 (Resource Cleanup)
+
+**중요**: 프로젝트 발표 후 AWS 비용을 절감하려면 반드시 리소스를 정리하세요!
+
+### 방법 1: Streamlit UI에서 삭제 (간편)
+
+**개별 문서 삭제**
+1. 사이드바 "🗂️ 문서 관리" 섹션 확인
+2. 삭제할 문서의 expandable 클릭
+3. "🗑️ 삭제" 버튼 클릭
+
+**모든 문서 삭제**
+1. "🗑️ 모든 문서 삭제" 버튼 클릭
+2. 확인 경고 표시 → 한 번 더 클릭하여 확정
+
+### 방법 2: cleanup.py 스크립트 사용 (권장)
+
+**인터랙티브 모드** (가장 안전)
+```bash
+python cleanup.py
+```
+대화형 메뉴를 통해:
+- 저장된 문서 목록 확인
+- 개별 문서 삭제
+- 모든 벡터 삭제
+- 각 단계마다 확인 절차 포함
+
+**명령줄 옵션**
+
+```bash
+# 저장된 문서 목록만 확인
+python cleanup.py --list
+
+# 특정 문서 삭제 (확인 포함)
+python cleanup.py --delete "document.pdf"
+
+# 특정 문서 즉시 삭제 (확인 없이)
+python cleanup.py --delete "document.pdf" --force
+
+# 모든 벡터 삭제 (확인 포함)
+python cleanup.py --delete-all
+
+# 모든 벡터 즉시 삭제 (확인 없이)
+python cleanup.py --delete-all --force
+```
+
+### 정리 범위
+
+✅ **삭제되는 항목**
+- S3 Vectors에 저장된 모든 벡터 데이터
+- 문서 메타데이터 (문서명, 페이지, 청크 정보)
+
+❌ **삭제되지 않는 항목** (수동 삭제 필요)
+- S3 Vector Bucket 자체
+- S3 Vector Index 자체
+- 원본 업로드 파일 (로컬에만 존재)
+
+### 비용 최적화 팁
+
+1. **프로젝트 발표 직후**: `python cleanup.py --delete-all --force` 실행
+2. **테스트 중**: UI에서 불필요한 문서만 개별 삭제
+3. **완전 종료 시**: AWS Console에서 Vector Bucket/Index도 삭제
+4. **정기 점검**: `python cleanup.py --list`로 저장된 벡터 확인
+
+### AWS Console에서 완전 삭제 (선택)
+
+Vector 데이터 삭제 후에도 Bucket/Index는 남아있어 최소 비용이 발생할 수 있습니다.
+
+```bash
+# AWS CLI로 Index 삭제
+aws s3vectors delete-vector-index \
+  --vector-bucket-name YOUR_BUCKET_NAME \
+  --index-name YOUR_INDEX_NAME
+
+# Bucket 삭제 (Index가 모두 삭제된 후)
+aws s3vectors delete-vector-bucket \
+  --vector-bucket-name YOUR_BUCKET_NAME
+```
+
+또는 AWS Console → S3 → Vector Buckets에서 수동 삭제
 
 ## 🔧 설정 옵션
 
