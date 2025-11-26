@@ -1,7 +1,7 @@
 """Document text extraction module for PDF, DOCX, and TXT files"""
 
 from typing import List, Dict
-from PyPDF2 import PdfReader
+from pypdf import PdfReader
 from docx import Document
 import io
 

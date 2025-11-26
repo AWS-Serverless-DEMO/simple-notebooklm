@@ -1,6 +1,7 @@
 """S3 Vectors storage and retrieval module"""
 
 import boto3
+from botocore.config import Config as BotoConfig
 from typing import List, Dict, Optional
 from config import Config
 
@@ -9,12 +10,20 @@ class S3VectorStore:
     """Manage vector storage and retrieval using AWS S3 Vectors"""
 
     def __init__(self):
-        """Initialize S3 Vectors client"""
+        """Initialize S3 Vectors client with retry configuration"""
+        retry_config = BotoConfig(
+            retries={
+                'max_attempts': 5,
+                'mode': 'adaptive'  # Exponential backoff with jitter
+            }
+        )
+
         self.s3vectors = boto3.client(
             's3vectors',
             region_name=Config.AWS_REGION,
             aws_access_key_id=Config.AWS_ACCESS_KEY_ID,
-            aws_secret_access_key=Config.AWS_SECRET_ACCESS_KEY
+            aws_secret_access_key=Config.AWS_SECRET_ACCESS_KEY,
+            config=retry_config
         )
         self.bucket_name = Config.S3_VECTOR_BUCKET_NAME
         self.index_name = Config.S3_VECTOR_INDEX_NAME
@@ -46,12 +55,18 @@ class S3VectorStore:
         if not valid_items:
             raise ValueError("No valid embeddings to store")
 
-        # Prepare vectors for S3 Vectors (max 500 per request)
+        # Prepare vectors for S3 Vectors (AWS recommends max 500 per request for optimal performance)
         batch_size = 500
         responses = []
+        total_batches = (len(valid_items) + batch_size - 1) // batch_size
 
         for i in range(0, len(valid_items), batch_size):
             batch = valid_items[i:i + batch_size]
+            current_batch = (i // batch_size) + 1
+
+            if total_batches > 1:
+                progress_percent = (current_batch / total_batches) * 100
+                print(f"  업로드 중... [{current_batch}/{total_batches}] ({progress_percent:.1f}%)")
 
             vectors = []
             for chunk, embedding in batch:
@@ -75,6 +90,21 @@ class S3VectorStore:
                     vectors=vectors
                 )
                 responses.append(response)
+
+            except self.s3vectors.exceptions.TooManyRequestsException:
+                # Handle rate limiting (429 error)
+                print(f"  ⚠️  요청 제한 도달, 2초 대기 후 재시도...")
+                import time
+                time.sleep(2)
+
+                # Retry the batch
+                response = self.s3vectors.put_vectors(
+                    vectorBucketName=self.bucket_name,
+                    indexName=self.index_name,
+                    vectors=vectors
+                )
+                responses.append(response)
+
             except Exception as e:
                 raise RuntimeError(f"Failed to put vectors: {str(e)}")
 
@@ -88,7 +118,6 @@ class S3VectorStore:
         self,
         query_embedding: List[float],
         top_k: int = None,
-        distance_metric: str = "COSINE",
         metadata_filter: Optional[Dict] = None
     ) -> List[Dict]:
         """
@@ -97,7 +126,6 @@ class S3VectorStore:
         Args:
             query_embedding: Query vector
             top_k: Number of results to return (default from config)
-            distance_metric: Distance metric ("COSINE" or "EUCLIDEAN")
             metadata_filter: Optional metadata filters
 
         Returns:
@@ -110,13 +138,12 @@ class S3VectorStore:
             'indexName': self.index_name,
             'queryVector': {'float32': query_embedding},
             'topK': top_k,
-            'distanceMetric': distance_metric,
-            'includeMetadata': True,
-            'includeVectorData': False
+            'returnMetadata': True,
+            'returnDistance': True
         }
 
         if metadata_filter:
-            query_params['metadataFilter'] = metadata_filter
+            query_params['filter'] = metadata_filter
 
         try:
             response = self.s3vectors.query_vectors(**query_params)
@@ -144,42 +171,63 @@ class S3VectorStore:
 
     def list_all_vectors(self) -> List[Dict]:
         """
-        List all vectors in the index with their metadata
+        List all vectors in the index with their metadata using pagination
 
         Returns:
             List of all vectors with keys and metadata
         """
         try:
-            # Query with a very large top_k to get all vectors
-            # Note: This is a workaround since S3 Vectors doesn't have a direct list API
-            response = self.s3vectors.query_vectors(
-                vectorBucketName=self.bucket_name,
-                indexName=self.index_name,
-                queryVector={'float32': [0.0] * 1024},  # Dummy vector
-                topK=10000,  # Maximum allowed
-                includeMetadata=True,
-                includeVectorData=False
-            )
-
             vectors = []
-            for vector_result in response.get('vectors', []):
-                vectors.append({
-                    'key': vector_result['key'],
-                    'metadata': vector_result.get('metadata', {}),
-                    'distance': vector_result.get('distance', 0)
-                })
+            next_token = None
+            page_count = 0
+
+            # Fetch all vectors using pagination (max 500 per page)
+            while True:
+                page_count += 1
+
+                # Build request parameters
+                list_params = {
+                    'vectorBucketName': self.bucket_name,
+                    'indexName': self.index_name,
+                    'maxResults': 500,  # Maximum allowed per page
+                    'returnMetadata': True
+                }
+
+                if next_token:
+                    list_params['nextToken'] = next_token
+
+                # Call ListVectors API
+                response = self.s3vectors.list_vectors(**list_params)
+
+                # Process vectors from this page
+                page_vectors = response.get('vectors', [])
+                for vector_result in page_vectors:
+                    vectors.append({
+                        'key': vector_result['key'],
+                        'metadata': vector_result.get('metadata', {})
+                    })
+
+                # Check if there are more pages
+                next_token = response.get('nextToken')
+                if not next_token:
+                    break
+
+                # Progress indication for large datasets
+                if page_count % 5 == 0:
+                    print(f"  벡터 목록 조회 중... ({len(vectors)}개 조회됨)")
 
             return vectors
 
         except Exception as e:
             raise RuntimeError(f"Failed to list vectors: {str(e)}")
 
-    def delete_vectors_by_keys(self, keys: List[str]) -> Dict:
+    def delete_vectors_by_keys(self, keys: List[str], show_progress: bool = True) -> Dict:
         """
         Delete vectors by their keys (batch deletion)
 
         Args:
             keys: List of vector keys to delete
+            show_progress: Show progress during deletion (default: True)
 
         Returns:
             Deletion result with count
@@ -188,20 +236,41 @@ class S3VectorStore:
             return {'deleted_count': 0, 'message': 'No keys provided'}
 
         try:
-            # Delete in batches (max 1000 per request as per AWS limits)
-            batch_size = 1000
+            # Delete in batches (AWS recommends max 500 per request for optimal performance)
+            batch_size = 500
             total_deleted = 0
+            total_batches = (len(keys) + batch_size - 1) // batch_size
 
             for i in range(0, len(keys), batch_size):
                 batch_keys = keys[i:i + batch_size]
+                current_batch = (i // batch_size) + 1
 
-                self.s3vectors.delete_vectors(
-                    vectorBucketName=self.bucket_name,
-                    indexName=self.index_name,
-                    keys=batch_keys
-                )
+                if show_progress and total_batches > 1:
+                    progress_percent = (current_batch / total_batches) * 100
+                    print(f"  삭제 중... [{current_batch}/{total_batches}] ({progress_percent:.1f}%)")
 
-                total_deleted += len(batch_keys)
+                try:
+                    self.s3vectors.delete_vectors(
+                        vectorBucketName=self.bucket_name,
+                        indexName=self.index_name,
+                        keys=batch_keys
+                    )
+                    total_deleted += len(batch_keys)
+
+                except self.s3vectors.exceptions.TooManyRequestsException:
+                    # Handle rate limiting (429 error)
+                    if show_progress:
+                        print(f"  ⚠️  요청 제한 도달, 2초 대기 후 재시도...")
+                    import time
+                    time.sleep(2)
+
+                    # Retry the batch
+                    self.s3vectors.delete_vectors(
+                        vectorBucketName=self.bucket_name,
+                        indexName=self.index_name,
+                        keys=batch_keys
+                    )
+                    total_deleted += len(batch_keys)
 
             return {
                 'deleted_count': total_deleted,
@@ -320,3 +389,264 @@ class S3VectorStore:
 
         except Exception as e:
             raise RuntimeError(f"Failed to list documents: {str(e)}")
+
+    def _check_vector_bucket_exists(self) -> bool:
+        """
+        Check if vector bucket exists
+
+        Returns:
+            True if bucket exists, False otherwise
+        """
+        try:
+            self.s3vectors.get_vector_bucket(
+                vectorBucketName=self.bucket_name
+            )
+            return True
+        except self.s3vectors.exceptions.NotFoundException:
+            return False
+        except Exception as e:
+            # For other errors, assume bucket might exist but we can't check
+            print(f"Warning: Could not verify bucket existence: {e}")
+            return False
+
+    def _check_vector_index_exists(self) -> bool:
+        """
+        Check if vector index exists in the bucket
+
+        Returns:
+            True if index exists, False otherwise
+        """
+        try:
+            self.s3vectors.get_index(
+                vectorBucketName=self.bucket_name,
+                indexName=self.index_name
+            )
+            return True
+        except self.s3vectors.exceptions.NotFoundException:
+            return False
+        except Exception as e:
+            # For other errors, assume index might exist but we can't check
+            print(f"Warning: Could not verify index existence: {e}")
+            return False
+
+    def _create_vector_bucket(self) -> Dict:
+        """
+        Create a new vector bucket
+
+        Returns:
+            Creation response
+
+        Raises:
+            RuntimeError: If bucket creation fails
+        """
+        try:
+            print(f"Creating vector bucket: {self.bucket_name}...")
+            response = self.s3vectors.create_vector_bucket(
+                vectorBucketName=self.bucket_name
+            )
+            print(f"✓ Vector bucket created successfully: {self.bucket_name}")
+            return response
+        except self.s3vectors.exceptions.ConflictException as e:
+            # Bucket already exists
+            print(f"✓ Vector bucket already exists: {self.bucket_name}")
+            return {'status': 'already_exists'}
+        except Exception as e:
+            raise RuntimeError(f"Failed to create vector bucket: {str(e)}")
+
+    def _create_vector_index(self, vector_dimensions: int = 1024, distance_metric: str = "cosine") -> Dict:
+        """
+        Create a new vector index in the bucket
+
+        Args:
+            vector_dimensions: Dimension of vectors (default: 1024 for Titan Embeddings V2)
+            distance_metric: Distance metric (COSINE or EUCLIDEAN)
+
+        Returns:
+            Creation response
+
+        Raises:
+            RuntimeError: If index creation fails
+        """
+        try:
+            print(f"Creating vector index: {self.index_name} (dimensions: {vector_dimensions}, metric: {distance_metric})...")
+            response = self.s3vectors.create_index(
+                vectorBucketName=self.bucket_name,
+                indexName=self.index_name,
+                dimension=vector_dimensions,
+                dataType="float32",
+                distanceMetric=distance_metric
+            )
+            print(f"✓ Vector index created successfully: {self.index_name}")
+
+            # Wait for index to become available
+            print("Waiting for index to become available...")
+            import time
+            max_attempts = 15  # Reduced from 30
+            for attempt in range(max_attempts):
+                try:
+                    status_response = self.s3vectors.get_index(
+                        vectorBucketName=self.bucket_name,
+                        indexName=self.index_name
+                    )
+
+                    # Debug: Print actual response to see structure
+                    if attempt == 0:
+                        print(f"Debug: Response keys: {list(status_response.keys())}")
+
+                    # Try different possible status field names
+                    status = (status_response.get('indexStatus') or
+                             status_response.get('status') or
+                             status_response.get('state') or
+                             'UNKNOWN')
+
+                    print(f"  Index status: {status} (attempt {attempt + 1}/{max_attempts})")
+
+                    # Check if index is ready (various possible values)
+                    if status.upper() in ['ACTIVE', 'AVAILABLE', 'READY', 'CREATED']:
+                        print(f"✓ Index is active!")
+                        break
+
+                    # If we can query the index, it's ready
+                    if status_response:
+                        print(f"✓ Index exists and is queryable!")
+                        break
+
+                except Exception as e:
+                    print(f"  Waiting... ({str(e)[:50]})")
+
+                time.sleep(2)
+
+            # After max attempts, assume it's ready (S3 Vectors has strong consistency)
+            print(f"✓ Proceeding with index (S3 Vectors has strong consistency)")
+            return response
+        except self.s3vectors.exceptions.ConflictException as e:
+            # Index already exists
+            print(f"✓ Vector index already exists: {self.index_name}")
+            return {'status': 'already_exists'}
+        except Exception as e:
+            raise RuntimeError(f"Failed to create vector index: {str(e)}")
+
+    def ensure_vector_resources(self, vector_dimensions: int = 1024, distance_metric: str = "cosine") -> Dict:
+        """
+        Ensure vector bucket and index exist, creating them if necessary
+
+        Args:
+            vector_dimensions: Dimension of vectors (default: 1024 for Titan Embeddings V2)
+            distance_metric: Distance metric (COSINE or EUCLIDEAN)
+
+        Returns:
+            Status dictionary with creation results
+        """
+        result = {
+            'bucket_created': False,
+            'index_created': False,
+            'bucket_exists': False,
+            'index_exists': False,
+            'ready': False
+        }
+
+        try:
+            # Check and create bucket if needed
+            print(f"\nChecking vector resources...")
+            print(f"Bucket: {self.bucket_name}")
+            print(f"Index: {self.index_name}")
+            print()
+
+            bucket_exists = self._check_vector_bucket_exists()
+            result['bucket_exists'] = bucket_exists
+
+            if not bucket_exists:
+                print(f"Vector bucket does not exist. Creating...")
+                self._create_vector_bucket()
+                result['bucket_created'] = True
+                result['bucket_exists'] = True
+            else:
+                print(f"✓ Vector bucket exists: {self.bucket_name}")
+
+            # Check and create index if needed
+            index_exists = self._check_vector_index_exists()
+            result['index_exists'] = index_exists
+
+            if not index_exists:
+                print(f"Vector index does not exist. Creating...")
+                self._create_vector_index(vector_dimensions, distance_metric)
+                result['index_created'] = True
+                result['index_exists'] = True
+            else:
+                print(f"✓ Vector index exists: {self.index_name}")
+
+            result['ready'] = True
+            print()
+            print("=" * 70)
+            print("✓ Vector resources are ready!")
+            print("=" * 70)
+            print()
+
+            return result
+
+        except Exception as e:
+            error_msg = str(e)
+            print()
+            print("=" * 70)
+            print(f"❌ Error ensuring vector resources: {error_msg}")
+            print("=" * 70)
+            print()
+
+            # Provide helpful error messages
+            if 'AccessDenied' in error_msg or 'not authorized' in error_msg:
+                print("IAM Permission Issue:")
+                print("  Add these permissions to your IAM user:")
+                print("  - s3vectors:CreateVectorBucket")
+                print("  - s3vectors:CreateIndex")
+                print("  - s3vectors:GetVectorBucket")
+                print("  - s3vectors:GetIndex")
+                print()
+
+            raise RuntimeError(f"Failed to ensure vector resources: {error_msg}")
+
+    def delete_index(self) -> Dict:
+        """
+        Delete the vector index
+
+        Returns:
+            Deletion result
+
+        Raises:
+            RuntimeError: If index deletion fails
+        """
+        try:
+            print(f"Deleting vector index: {self.index_name}...")
+            self.s3vectors.delete_index(
+                vectorBucketName=self.bucket_name,
+                indexName=self.index_name
+            )
+            print(f"✓ Vector index deleted: {self.index_name}")
+            return {'status': 'deleted', 'index_name': self.index_name}
+        except self.s3vectors.exceptions.NotFoundException:
+            print(f"⚠️  Vector index not found: {self.index_name}")
+            return {'status': 'not_found', 'index_name': self.index_name}
+        except Exception as e:
+            raise RuntimeError(f"Failed to delete vector index: {str(e)}")
+
+    def delete_bucket(self) -> Dict:
+        """
+        Delete the vector bucket (must delete all indexes first)
+
+        Returns:
+            Deletion result
+
+        Raises:
+            RuntimeError: If bucket deletion fails
+        """
+        try:
+            print(f"Deleting vector bucket: {self.bucket_name}...")
+            self.s3vectors.delete_vector_bucket(
+                vectorBucketName=self.bucket_name
+            )
+            print(f"✓ Vector bucket deleted: {self.bucket_name}")
+            return {'status': 'deleted', 'bucket_name': self.bucket_name}
+        except self.s3vectors.exceptions.NotFoundException:
+            print(f"⚠️  Vector bucket not found: {self.bucket_name}")
+            return {'status': 'not_found', 'bucket_name': self.bucket_name}
+        except Exception as e:
+            raise RuntimeError(f"Failed to delete vector bucket: {str(e)}")

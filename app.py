@@ -36,6 +36,24 @@ def initialize_session_state():
         st.session_state.refresh_documents = True
 
 
+@st.cache_resource
+def get_vector_store():
+    """Get cached S3VectorStore instance"""
+    return S3VectorStore()
+
+
+@st.cache_resource
+def get_embeddings_generator():
+    """Get cached EmbeddingsGenerator instance"""
+    return EmbeddingsGenerator()
+
+
+@st.cache_resource
+def get_rag_engine():
+    """Get cached RAGEngine instance"""
+    return RAGEngine()
+
+
 def validate_config():
     """Validate configuration and show errors if needed"""
     try:
@@ -44,6 +62,41 @@ def validate_config():
     except ValueError as e:
         st.error(f"⚠️ Configuration Error: {str(e)}")
         st.info("Please set up your `.env` file with required AWS credentials and S3 Vector configuration.")
+        return False
+
+
+def initialize_vector_resources():
+    """Initialize vector resources (auto-create if needed)"""
+    try:
+        vector_store = get_vector_store()
+
+        # Show initialization status
+        with st.spinner("🔧 Checking S3 Vector resources..."):
+            result = vector_store.ensure_vector_resources()
+
+        if result['bucket_created'] or result['index_created']:
+            st.success("✅ Vector resources created successfully!")
+            if result['bucket_created']:
+                st.info(f"📦 Created new Vector Bucket: {Config.S3_VECTOR_BUCKET_NAME}")
+            if result['index_created']:
+                st.info(f"📊 Created new Vector Index: {Config.S3_VECTOR_INDEX_NAME}")
+
+        return True
+
+    except Exception as e:
+        st.error(f"❌ Failed to initialize vector resources: {str(e)}")
+
+        # Check for permission issues
+        if 'AccessDenied' in str(e) or 'not authorized' in str(e):
+            st.warning("⚠️ IAM Permission Issue Detected")
+            st.code("""
+Add these permissions to your IAM user:
+- s3vectors:CreateVectorBucket
+- s3vectors:CreateIndex
+- s3vectors:GetVectorBucket
+- s3vectors:GetIndex
+            """)
+
         return False
 
 
@@ -69,7 +122,7 @@ def process_document(uploaded_file):
 
         # Generate embeddings
         with st.spinner("🧮 임베딩 벡터 생성 중... (시간이 소요될 수 있습니다)"):
-            embeddings_gen = EmbeddingsGenerator()
+            embeddings_gen = get_embeddings_generator()
             chunk_texts = [chunk['content'] for chunk in chunks]
             embeddings = embeddings_gen.generate_embeddings_batch(chunk_texts)
 
@@ -78,7 +131,7 @@ def process_document(uploaded_file):
 
         # Store in S3 Vectors
         with st.spinner("💾 S3 Vectors에 저장 중..."):
-            vector_store = S3VectorStore()
+            vector_store = get_vector_store()
             result = vector_store.put_vectors(chunks, embeddings)
 
             st.success(f"✅ {result['total_stored']}개 벡터 저장 완료 ({result['batches']}개 배치)")
@@ -185,8 +238,16 @@ def main():
     if not validate_config():
         st.stop()
 
-    # Initialize vector store once
-    vector_store = S3VectorStore()
+    # Initialize vector resources (auto-create if needed)
+    if 'vector_resources_initialized' not in st.session_state:
+        if initialize_vector_resources():
+            st.session_state.vector_resources_initialized = True
+        else:
+            st.error("⚠️ Vector resources could not be initialized. Please check your IAM permissions.")
+            st.stop()
+
+    # Get cached vector store
+    vector_store = get_vector_store()
 
     # Sidebar - Document Upload
     with st.sidebar:
@@ -289,7 +350,7 @@ def main():
         if ask_button and question:
             with st.spinner("🤔 답변을 생성하는 중..."):
                 try:
-                    rag_engine = RAGEngine()
+                    rag_engine = get_rag_engine()
                     result = rag_engine.ask(question)
 
                     # Add to chat history
@@ -333,7 +394,7 @@ def main():
         - ✂️ **청크 분할**: LangChain RecursiveCharacterTextSplitter
         - 🧮 **임베딩**: AWS Bedrock Titan Text Embeddings V2 (1024차원)
         - 💾 **벡터 저장**: AWS S3 Vectors (Native Vector Storage)
-        - 🤖 **답변 생성**: AWS Bedrock Claude 3 Sonnet
+        - 🤖 **답변 생성**: AWS Bedrock Claude Sonnet 4
         """)
 
 

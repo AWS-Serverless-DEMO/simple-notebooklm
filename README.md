@@ -4,7 +4,7 @@ AWS S3 Vectors와 Bedrock Claude를 활용한 문서 기반 질의응답(RAG) �
 
 ## 🎯 프로젝트 개요
 
-Simple NotebookLM은 PDF, DOCX, TXT 문서를 업로드하고 AI에게 문서 내용에 대해 질문할 수 있는 웹 애플리케이션입니다. AWS의 최신 벡터 스토리지 기술인 S3 Vectors와 Claude 3를 활용하여 정확한 답변과 출처를 제공합니다.
+Simple NotebookLM은 PDF, DOCX, TXT 문서를 업로드하고 AI에게 문서 내용에 대해 질문할 수 있는 웹 애플리케이션입니다. AWS의 최신 벡터 스토리지 기술인 S3 Vectors와 Claude Sonnet 4를 활용하여 정확한 답변과 출처를 제공합니다.
 
 ## 🏗️ 아키텍처
 
@@ -37,7 +37,7 @@ Simple NotebookLM은 PDF, DOCX, TXT 문서를 업로드하고 AI에게 문서 �
 - **청크 분할**: LangChain RecursiveCharacterTextSplitter
 - **임베딩**: AWS Bedrock Titan Text Embeddings V2 (1024차원)
 - **벡터 저장**: AWS S3 Vectors (Preview)
-- **LLM**: AWS Bedrock Claude 3 Sonnet
+- **LLM**: AWS Bedrock Claude Sonnet 4
 
 ## 📁 프로젝트 구조
 
@@ -74,7 +74,7 @@ simple-notebooklm/
 1. AWS Console → Bedrock → Model access 이동
 2. 다음 모델 액세스 요청:
    - Amazon Titan Text Embeddings V2
-   - Anthropic Claude 3 Sonnet
+   - Anthropic Claude Sonnet 4
 
 #### 2.2 S3 Vectors 설정
 
@@ -88,30 +88,39 @@ IAM 사용자/역할에 다음 권한 추가:
 
 ```json
 {
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": [
-        "bedrock:InvokeModel",
-        "bedrock:InvokeModelWithResponseStream"
-      ],
-      "Resource": [
-        "arn:aws:bedrock:*::foundation-model/amazon.titan-embed-text-v2:0",
-        "arn:aws:bedrock:*::foundation-model/anthropic.claude-3-sonnet-*"
-      ]
-    },
-    {
-      "Effect": "Allow",
-      "Action": [
-        "s3vectors:PutVectors",
-        "s3vectors:QueryVectors",
-        "s3vectors:GetVectors",
-        "s3vectors:DeleteVectors"
-      ],
-      "Resource": "arn:aws:s3vectors:*:*:vectorbucket/*"
-    }
-  ]
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "BedrockAccess",
+            "Effect": "Allow",
+            "Action": [
+                "bedrock:InvokeModel",
+                "bedrock:InvokeModelWithResponseStream"
+            ],
+            "Resource": [
+                "arn:aws:bedrock:*::foundation-model/amazon.titan-embed-text-v2:0",
+                "arn:aws:bedrock:*::foundation-model/anthropic.*"
+            ]
+        },
+        {
+            "Sid": "S3VectorsReadWrite",
+            "Effect": "Allow",
+            "Action": [
+                "s3vectors:PutVectors",
+                "s3vectors:QueryVectors",
+                "s3vectors:GetVectors",
+                "s3vectors:DeleteVectors",
+                "s3vectors:ListVectors",
+                "s3vectors:CreateIndex",
+                "s3vectors:CreateVectorBucket",
+                "s3vectors:ListVectorBuckets",
+                "s3vectors:ListIndexes",
+                "s3vectors:GetVectorBucket",
+                "s3vectors:GetIndex"
+            ],
+            "Resource": "arn:aws:s3vectors:*:*:bucket/*"
+        }
+    ]
 }
 ```
 
@@ -153,13 +162,13 @@ S3_VECTOR_INDEX_NAME=my-vector-index
 
 # Bedrock Model IDs
 BEDROCK_EMBEDDING_MODEL_ID=amazon.titan-embed-text-v2:0
-BEDROCK_LLM_MODEL_ID=anthropic.claude-3-sonnet-20240229-v1:0
+BEDROCK_LLM_MODEL_ID=global.anthropic.claude-sonnet-4-20250514-v1:0
 
 # Application Settings
-CHUNK_SIZE=500
-CHUNK_OVERLAP=50
-SIMILARITY_THRESHOLD=0.7
-TOP_K_RESULTS=3
+CHUNK_SIZE=1000
+CHUNK_OVERLAP=100
+SIMILARITY_THRESHOLD=0.15
+TOP_K_RESULTS=15
 ```
 
 ### 5. 실행
@@ -285,10 +294,10 @@ aws s3vectors delete-vector-bucket \
 
 | 설정 | 기본값 | 설명 |
 |------|--------|------|
-| `CHUNK_SIZE` | 500 | 청크 최대 크기 (문자 수) |
-| `CHUNK_OVERLAP` | 50 | 청크 간 중복 문자 수 |
-| `SIMILARITY_THRESHOLD` | 0.7 | 유사도 임계값 (0.0 ~ 1.0) |
-| `TOP_K_RESULTS` | 3 | 검색할 최대 청크 수 |
+| `CHUNK_SIZE` | 1000 | 청크 최대 크기 (문자 수) |
+| `CHUNK_OVERLAP` | 100 | 청크 간 중복 문자 수 |
+| `SIMILARITY_THRESHOLD` | 0.15 | 유사도 임계값 (0.0 ~ 1.0, NotebookLM 스타일: 낮은 값으로 LLM이 관련성 판단) |
+| `TOP_K_RESULTS` | 15 | 검색할 최대 청크 수 (더 많은 후보를 LLM에게 제공) |
 
 ## 📊 주요 특징
 
@@ -308,7 +317,13 @@ aws s3vectors delete-vector-bucket \
 - 최대 90% 비용 절감
 - 서브초(sub-second) 쿼리 성능
 
-### 4. 정확한 출처 제공
+### 4. NotebookLM 스타일 지능형 RAG
+- **낮은 임계값 (0.15)**: 벡터 검색은 후보만 찾고, LLM이 최종 관련성 판단
+- **LLM 기반 필터링**: Claude가 검색된 청크 중 실제 관련 있는 내용만 사용
+- **의미적 이해**: 표현이 다르더라도 의미가 같으면 연결 (예: "만점 받으려면?" → "채점 기준" 활용)
+- **스마트 컨텍스트 활용**: 15개 후보 청크를 LLM에게 제공하여 최적의 답변 생성
+
+### 5. 정확한 출처 제공
 - 답변과 함께 문서명, 페이지 번호 제공
 - 유사도 점수로 신뢰도 표시
 - 관련 청크 미리보기 제공

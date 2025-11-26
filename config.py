@@ -18,7 +18,7 @@ class Config:
 
     # Bedrock Model IDs
     BEDROCK_EMBEDDING_MODEL_ID = os.getenv('BEDROCK_EMBEDDING_MODEL_ID', 'amazon.titan-embed-text-v2:0')
-    BEDROCK_LLM_MODEL_ID = os.getenv('BEDROCK_LLM_MODEL_ID', 'anthropic.claude-3-sonnet-20240229-v1:0')
+    BEDROCK_LLM_MODEL_ID = os.getenv('BEDROCK_LLM_MODEL_ID', 'global.anthropic.claude-sonnet-4-20250514-v1:0')
 
     # Application Settings
     CHUNK_SIZE = int(os.getenv('CHUNK_SIZE', 500))

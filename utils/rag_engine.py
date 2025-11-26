@@ -2,6 +2,7 @@
 
 import json
 import boto3
+from botocore.config import Config as BotoConfig
 from typing import List, Dict, Optional
 from config import Config
 from .embeddings import EmbeddingsGenerator
@@ -12,12 +13,20 @@ class RAGEngine:
     """RAG engine for question answering with document context"""
 
     def __init__(self):
-        """Initialize RAG engine with Bedrock Claude"""
+        """Initialize RAG engine with Bedrock Claude and retry configuration"""
+        retry_config = BotoConfig(
+            retries={
+                'max_attempts': 5,
+                'mode': 'adaptive'  # Exponential backoff with jitter
+            }
+        )
+
         self.bedrock_runtime = boto3.client(
             'bedrock-runtime',
             region_name=Config.AWS_REGION,
             aws_access_key_id=Config.AWS_ACCESS_KEY_ID,
-            aws_secret_access_key=Config.AWS_SECRET_ACCESS_KEY
+            aws_secret_access_key=Config.AWS_SECRET_ACCESS_KEY,
+            config=retry_config
         )
         self.model_id = Config.BEDROCK_LLM_MODEL_ID
         self.embeddings_generator = EmbeddingsGenerator()
@@ -38,18 +47,33 @@ class RAGEngine:
         # Generate embedding for the question
         question_embedding = self.embeddings_generator.generate_embedding(question)
 
+        print(f"\n[DEBUG] Question embedding generated: {len(question_embedding)} dimensions")
+
         # Query similar chunks from vector store
         results = self.vector_store.query_vectors(
             query_embedding=question_embedding,
-            top_k=top_k or Config.TOP_K_RESULTS,
-            distance_metric="COSINE"
+            top_k=top_k or Config.TOP_K_RESULTS
         )
+
+        print(f"[DEBUG] Query returned {len(results)} results")
+        if results:
+            print(f"[DEBUG] Top 3 results:")
+            for i, result in enumerate(results[:3], 1):
+                similarity = result.get('similarity', 0)
+                content_preview = result.get('content', '')[:100].replace('\n', ' ')
+                doc_name = result.get('metadata', {}).get('document', 'Unknown')
+                page = result.get('metadata', {}).get('page', '?')
+                print(f"  [{i}] 유사도: {similarity:.4f} | 문서: {doc_name} (p.{page})")
+                print(f"      내용: {content_preview}...")
+            print(f"[DEBUG] Similarity threshold: {self.similarity_threshold}")
 
         # Filter by similarity threshold
         filtered_results = [
             result for result in results
             if result['similarity'] >= self.similarity_threshold
         ]
+
+        print(f"[DEBUG] After filtering: {len(filtered_results)} relevant results (threshold >= {self.similarity_threshold})")
 
         return {
             'chunks': filtered_results,
@@ -96,19 +120,31 @@ class RAGEngine:
 
         context = "\n\n".join(context_parts)
 
-        # Build prompt for Claude
-        prompt = f"""다음 문서 내용을 바탕으로 질문에 답변해주세요.
+        # Build prompt for Claude (NotebookLM style)
+        prompt = f"""당신은 문서 기반 질의응답 AI입니다. 아래 제공된 문서 청크들을 분석하여 질문에 답변하세요.
 
-문서 내용:
+검색된 문서 청크들:
 {context}
 
 질문: {question}
 
-답변 지침:
-1. 제공된 문서 내용만을 사용하여 답변하세요.
-2. 답변 시 반드시 출처(문서명과 페이지 번호)를 명시하세요.
-3. 문서에 명확한 답변이 없다면 솔직히 말해주세요.
-4. 간결하고 명확하게 답변하세요."""
+중요한 답변 규칙:
+1. **관련성 판단**: 제공된 청크들 중에서 질문과 실제로 관련 있는 내용만 사용하세요.
+   - 유사도 점수가 낮더라도, 의미상 질문과 관련이 있다면 사용할 수 있습니다.
+   - 예: "만점 받으려면?" → "채점 기준", "평가 항목" 등의 청크가 관련 있음
+
+2. **관련 없는 청크 무시**: 질문과 무관한 청크는 무시하고 답변에 포함하지 마세요.
+
+3. **종합적 답변**: 여러 청크의 정보를 종합하여 구조화된 답변을 제공하세요.
+   - 관련 항목이 여러 개라면 번호를 매기거나 카테고리로 나누세요.
+   - 각 항목에 대해 상세히 설명하세요.
+
+4. **출처 명시**: 답변에 사용한 정보의 출처(문서명, 페이지)를 반드시 표시하세요.
+   - 예: "과제 설명서(p.5)에 따르면..."
+
+5. **정보 부족 시**: 제공된 문서에 관련 정보가 전혀 없다면, 솔직하게 "제공된 문서에서 관련 정보를 찾을 수 없습니다"라고 답변하세요.
+
+답변을 시작하세요:"""
 
         # Call Claude
         body = json.dumps({
