@@ -167,7 +167,7 @@ BEDROCK_LLM_MODEL_ID=global.anthropic.claude-sonnet-4-20250514-v1:0
 # Application Settings
 CHUNK_SIZE=1000
 CHUNK_OVERLAP=100
-SIMILARITY_THRESHOLD=0.15
+SIMILARITY_THRESHOLD=0.3
 TOP_K_RESULTS=15
 ```
 
@@ -296,7 +296,7 @@ aws s3vectors delete-vector-bucket \
 |------|--------|------|
 | `CHUNK_SIZE` | 1000 | 청크 최대 크기 (문자 수) |
 | `CHUNK_OVERLAP` | 100 | 청크 간 중복 문자 수 |
-| `SIMILARITY_THRESHOLD` | 0.15 | 유사도 임계값 (0.0 ~ 1.0, NotebookLM 스타일: 낮은 값으로 LLM이 관련성 판단) |
+| `SIMILARITY_THRESHOLD` | 0.3 | 유사도 임계값 (0.0 ~ 1.0, NotebookLM 스타일: 낮은 값으로 LLM이 관련성 판단) |
 | `TOP_K_RESULTS` | 15 | 검색할 최대 청크 수 (더 많은 후보를 LLM에게 제공) |
 
 ## 📊 주요 특징
